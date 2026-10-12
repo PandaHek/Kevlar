@@ -54,7 +54,104 @@ def load_config(path: Path | None = None) -> dict:
 
 
 def tokenize(text: str) -> list[str]:
+    text = (
+        text.replace("\u2019", "'")
+        .replace("\u2018", "'")
+        .replace("\u201c", '"')
+        .replace("\u201d", '"')
+    )
     return WORD_RE.findall(text.lower())
+
+
+def _phrase_starts(tokens: list[str], phrase: str) -> list[int]:
+    parts = phrase.lower().split()
+    width = len(parts)
+    if width == 0:
+        return []
+    return [
+        i
+        for i in range(len(tokens) - width + 1)
+        if tokens[i : i + width] == parts
+    ]
+
+
+def _negated(tokens: list[str], index: int) -> bool:
+    """True when don't / never / not sits just before the phrase."""
+    prev = tokens[max(0, index - 4) : index]
+    return any(tok in {"not", "never", "don't", "dont"} for tok in prev)
+
+
+def _secrecy_phrase_matches(tokens: list[str], phrases: Iterable[str]) -> list[Match]:
+    found: list[Match] = []
+    for phrase in phrases:
+        for start in _phrase_starts(tokens, phrase):
+            if _negated(tokens, start):
+                continue
+            found.append(
+                Match(word=phrase, weight=0.6, index=start, category="secrecy")
+            )
+    return found
+
+
+def _request_phrase_bonus(
+    tokens: list[str],
+    matches: list[Match],
+    phrases: Iterable[str],
+    window: int,
+    bonus: float,
+) -> tuple[float, list[str]]:
+    """Bonus when the caller asks someone to read a code aloud.
+
+    'Read it out' next to a code or the word verification counts.
+    'Never read it out' and 'do not read it out' do not.
+    """
+    credential_indexes = [m.index for m in matches if m.category == "credential"]
+    for phrase in phrases:
+        for start in _phrase_starts(tokens, phrase):
+            if _negated(tokens, start):
+                continue
+            near_credential = any(
+                abs(idx - start) <= window for idx in credential_indexes
+            )
+            if not near_credential:
+                lo = max(0, start - window)
+                hi = min(len(tokens), start + window)
+                near_credential = "verification" in tokens[lo:hi]
+            if not near_credential:
+                continue
+            return bonus, [
+                f"Asked to read a code aloud (request, +{bonus:.2f})"
+            ]
+    return 0.0, []
+
+
+def _upi_pin_request_bonus(
+    tokens: list[str],
+    verbs: Iterable[str],
+    window: int,
+    bonus: float,
+) -> tuple[float, list[str]]:
+    """Bonus when the caller asks someone to authorise or enter a UPI PIN.
+
+    'Never authorise with your UPI PIN' does not count.
+    A door PIN, or the word pin with no UPI beside it, does not count.
+    """
+    verb_set = {verb.lower() for verb in verbs}
+    pin_indexes = [
+        i
+        for i, tok in enumerate(tokens)
+        if tok == "pin" and "upi" in tokens[max(0, i - 3) : min(len(tokens), i + 4)]
+    ]
+    if not pin_indexes:
+        return 0.0, []
+    for i, tok in enumerate(tokens):
+        if tok not in verb_set or _negated(tokens, i):
+            continue
+        if any(abs(i - pin_i) <= window for pin_i in pin_indexes):
+            return bonus, [
+                f"Asked to authorise with a UPI PIN (request, +{bonus:.2f})"
+            ]
+    return 0.0, []
 
 
 def level_for_trust(trust: float) -> str:
@@ -142,7 +239,7 @@ def score_text(
     Score transcript text.
 
     risk = 100 * (1 - e^(-raw))
-    raw  = sum(pair contributions) + 2 * density
+    raw  = pair contributions + density + request-phrase bonus
     density = (# danger words in token window) / window_size  (capped view of packing)
 
     Optional decay: if seconds_since_last_hit is set and no new matches,
@@ -157,9 +254,29 @@ def score_text(
     tokens = tokenize(text)
     categories = _category_lookup(cfg)
     matches = _find_matches(tokens, weights, categories)
+    matches.extend(
+        _secrecy_phrase_matches(tokens, cfg.get("secrecy_phrases", []))
+    )
+    matches.sort(key=lambda m: m.index)
+    request_window = int(cfg.get("request_window", 20))
+    request_bonus_value = float(cfg.get("request_bonus", 0.9))
+    request_bonus, request_reasons = _request_phrase_bonus(
+        tokens,
+        matches,
+        cfg.get("request_phrases", []),
+        request_window,
+        request_bonus_value,
+    )
+    if request_bonus == 0:
+        request_bonus, request_reasons = _upi_pin_request_bonus(
+            tokens,
+            cfg.get("pin_request_verbs", []),
+            request_window,
+            request_bonus_value,
+        )
 
     risk = float(previous_risk)
-    if not matches:
+    if not matches and request_bonus == 0:
         if seconds_since_last_hit is not None and seconds_since_last_hit > 0:
             steps = int(seconds_since_last_hit // decay_seconds)
             for _ in range(steps):
@@ -189,7 +306,7 @@ def score_text(
     density = len(matches) / max(span, window_size)
     categories_hit = {m.category for m in matches}
     density_scale = 0.6 if len(categories_hit) <= 1 else 1.8
-    raw = pair_sum + (density_scale * density)
+    raw = pair_sum + (density_scale * density) + request_bonus
     chunk_risk = 100.0 * (1.0 - math.exp(-raw))
     # Rising risk takes the max of decayed previous and new chunk signal,
     # then blends upward so repeated scam chunks escalate.
@@ -198,8 +315,15 @@ def score_text(
         risk = max(risk, min(100.0, risk + 0.2 * chunk_risk))
     risk = min(100.0, risk)
 
-    unique_words = sorted({m.word for m in matches}, key=lambda w: -weights[w])
-    reasons = [f"Danger words: {', '.join(unique_words[:10])}"] + pair_reasons
+    best_weight: dict[str, float] = {}
+    for m in matches:
+        best_weight[m.word] = max(best_weight.get(m.word, 0.0), m.weight)
+    unique_words = sorted(best_weight, key=lambda w: -best_weight[w])
+    reasons = (
+        [f"Danger words: {', '.join(unique_words[:10])}"]
+        + request_reasons
+        + pair_reasons
+    )
 
     trust = max(0.0, min(100.0, 100.0 - risk))
     return ScoreResult(

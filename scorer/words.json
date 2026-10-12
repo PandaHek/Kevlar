@@ -5,6 +5,11 @@
   "alert_threshold": 60,
   "same_category_pair_scale": 0.25,
   "cross_category_pair_scale": 1.0,
+  "request_phrases": ["read it out"],
+  "request_window": 20,
+  "request_bonus": 0.9,
+  "pin_request_verbs": ["authorise", "authorize", "enter"],
+  "secrecy_phrases": ["between us"],
   "weights": {
     "otp": 0.9,
     "pin": 0.9,
