@@ -1,5 +1,7 @@
 """Tests for Kevlar proximity trust scorer."""
 
+from pathlib import Path
+
 from score import load_config, score_chunks, score_text
 
 
@@ -176,6 +178,55 @@ def test_never_authorise_upi_pin_is_not_a_request():
     )
     assert not any("asked to authorise" in r.lower() for r in warned.reasons)
     assert any("asked to authorise" in r.lower() for r in asked.reasons)
+
+
+def test_paraphrased_read_aloud_scripts_are_scams():
+    folder = Path(__file__).with_name("scripts")
+    for path in sorted(folder.glob("*.txt")):
+        result = score_text(path.read_text(encoding="utf-8"), CFG)
+        assert result.risk >= 80, (path.name, result.to_dict())
+        assert result.level == "likely_scam", path.name
+        assert any("read a code" in reason.lower() for reason in result.reasons)
+
+
+def test_otp_paraphrases_without_the_word_read():
+    samples = [
+        "Tell me the six-digit number in the message.",
+        "What is the numeric confirmation value on your screen?",
+        "Say the six-digit number aloud.",
+        "Share the number that just arrived.",
+        "Repeat the numeric value to me.",
+    ]
+    for text in samples:
+        result = score_text(text, CFG)
+        assert result.risk >= 80, (text, result.to_dict())
+        assert result.level == "likely_scam", text
+        assert any("one-time number" in reason.lower() for reason in result.reasons)
+
+
+def test_a_six_digit_number_on_screen_is_not_a_request():
+    text = (
+        "A six-digit number will appear in the app. Enter it only on the official page."
+    )
+    result = score_text(text, CFG)
+    assert not any("one-time number" in reason.lower() for reason in result.reasons)
+    assert result.level != "likely_scam", result.to_dict()
+
+
+def test_never_say_the_six_digit_number_is_not_a_request():
+    text = "Never say the six-digit number to a caller."
+    result = score_text(text, CFG)
+    assert not any("one-time number" in reason.lower() for reason in result.reasons)
+    assert result.risk < 40, result.to_dict()
+
+
+def test_read_the_reference_number_is_not_a_code_ask():
+    text = (
+        "Your account is fine. Please read the reference number on the receipt "
+        "and keep it for your records. A refund will arrive today."
+    )
+    result = score_text(text, CFG)
+    assert not any("read a code" in reason.lower() for reason in result.reasons)
 
 
 def test_decay_without_new_danger_words():

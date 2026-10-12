@@ -154,6 +154,84 @@ def _upi_pin_request_bonus(
     return 0.0, []
 
 
+def _read_aloud_bonus(
+    tokens: list[str],
+    *,
+    window: int,
+    bonus: float,
+    objects: Iterable[str],
+    number_guards: Iterable[str],
+    context_words: Iterable[str],
+) -> tuple[float, list[str]]:
+    """Bonus when a caller tells the user to read a code or number aloud.
+
+    Matches 'read me the code', 'read the number aloud', and 'read out the numeric'.
+    Skips 'account number' and 'reference number'. Skips 'do not read the code'.
+    A family OTP ask with no bank word (account, verification, refund, UPI) stays out.
+    """
+    object_set = {word.lower() for word in objects}
+    guard_set = {word.lower() for word in number_guards}
+    context_set = {word.lower() for word in context_words}
+    if not any(tok in context_set for tok in tokens):
+        return 0.0, []
+    for i, tok in enumerate(tokens):
+        if tok != "read" or _negated(tokens, i):
+            continue
+        lo = max(0, i - window)
+        hi = min(len(tokens), i + window + 1)
+        for j in range(lo, hi):
+            if j == i:
+                continue
+            word = tokens[j]
+            if word not in object_set:
+                continue
+            if word == "number" and j > 0 and tokens[j - 1] in guard_set:
+                continue
+            return bonus, [
+                f"Asked to read a code aloud (request, +{bonus:.2f})"
+            ]
+    return 0.0, []
+
+
+def _disclose_number_bonus(
+    tokens: list[str],
+    *,
+    window: int,
+    bonus: float,
+    verbs: Iterable[str],
+    number_guards: Iterable[str],
+) -> tuple[float, list[str]]:
+    """Bonus when any ask sits next to a one-time number, not only the word read.
+
+    Covers 'tell me the six-digit number', 'what is the numeric value',
+    'say it aloud', 'share the number', and 'repeat the numeric value'.
+    'Account number' and 'reference number' do not count.
+    'Never say the six-digit number' does not count.
+    A number that merely appears ('a six-digit number will arrive') does not count.
+    """
+    verb_set = {verb.lower() for verb in verbs}
+    guard_set = {word.lower() for word in number_guards}
+    secret_indexes = [
+        i
+        for i, tok in enumerate(tokens)
+        if tok == "numeric"
+        or (
+            tok == "number"
+            and (i == 0 or tokens[i - 1] not in guard_set)
+        )
+    ]
+    if not secret_indexes:
+        return 0.0, []
+    for i, tok in enumerate(tokens):
+        if tok not in verb_set or _negated(tokens, i):
+            continue
+        if any(abs(i - secret) <= window for secret in secret_indexes):
+            return bonus, [
+                f"Asked for a one-time number (request, +{bonus:.2f})"
+            ]
+    return 0.0, []
+
+
 def level_for_trust(trust: float) -> str:
     if trust >= 80:
         return "safe"
@@ -274,6 +352,50 @@ def score_text(
             request_window,
             request_bonus_value,
         )
+    if request_bonus == 0:
+        request_bonus, request_reasons = _read_aloud_bonus(
+            tokens,
+            window=int(cfg.get("read_aloud_window", 6)),
+            bonus=float(cfg.get("read_aloud_bonus", 1.15)),
+            objects=cfg.get(
+                "read_aloud_objects",
+                ["code", "otp", "pin", "numeric", "number"],
+            ),
+            number_guards=cfg.get(
+                "read_aloud_number_guards",
+                ["account", "reference", "mobile", "phone", "contact", "card", "case"],
+            ),
+            context_words=cfg.get(
+                "read_aloud_context",
+                ["account", "verification", "verify", "kyc", "refund", "upi"],
+            ),
+        )
+    if request_bonus == 0:
+        request_bonus, request_reasons = _disclose_number_bonus(
+            tokens,
+            window=int(cfg.get("read_aloud_window", 6)),
+            bonus=float(cfg.get("disclose_bonus", 1.7)),
+            verbs=cfg.get(
+                "disclose_verbs",
+                [
+                    "read",
+                    "tell",
+                    "say",
+                    "share",
+                    "give",
+                    "repeat",
+                    "dictate",
+                    "speak",
+                    "provide",
+                    "what",
+                    "what's",
+                ],
+            ),
+            number_guards=cfg.get(
+                "read_aloud_number_guards",
+                ["account", "reference", "mobile", "phone", "contact", "card", "case"],
+            ),
+        )
 
     risk = float(previous_risk)
     if not matches and request_bonus == 0:
@@ -293,19 +415,26 @@ def score_text(
             level=level_for_trust(trust),
         )
 
-    pair_sum, pair_reasons = _pair_contributions(
-        matches,
-        window_size,
-        same_category_scale=float(cfg.get("same_category_pair_scale", 0.25)),
-        cross_category_scale=float(cfg.get("cross_category_pair_scale", 1.0)),
-    )
-    # Density: how packed danger tokens are relative to span they occupy.
-    # Same-family-only clusters (otp+sms+code) get a weaker density push than
-    # multi-signal scam scripts (credential + threat + secrecy).
-    span = max(1, matches[-1].index - matches[0].index + 1)
-    density = len(matches) / max(span, window_size)
-    categories_hit = {m.category for m in matches}
-    density_scale = 0.6 if len(categories_hit) <= 1 else 1.8
+    if matches:
+        pair_sum, pair_reasons = _pair_contributions(
+            matches,
+            window_size,
+            same_category_scale=float(cfg.get("same_category_pair_scale", 0.25)),
+            cross_category_scale=float(cfg.get("cross_category_pair_scale", 1.0)),
+        )
+        # Density: how packed danger tokens are relative to span they occupy.
+        # Same-family-only clusters (otp+sms+code) get a weaker density push than
+        # multi-signal scam scripts (credential + threat + secrecy).
+        span = max(1, matches[-1].index - matches[0].index + 1)
+        density = len(matches) / max(span, window_size)
+        categories_hit = {m.category for m in matches}
+        density_scale = 0.6 if len(categories_hit) <= 1 else 1.8
+    else:
+        pair_sum = 0.0
+        pair_reasons = []
+        density = 0.0
+        categories_hit = set()
+        density_scale = 0.0
     raw = pair_sum + (density_scale * density) + request_bonus
     chunk_risk = 100.0 * (1.0 - math.exp(-raw))
     # Rising risk takes the max of decayed previous and new chunk signal,
@@ -319,11 +448,11 @@ def score_text(
     for m in matches:
         best_weight[m.word] = max(best_weight.get(m.word, 0.0), m.weight)
     unique_words = sorted(best_weight, key=lambda w: -best_weight[w])
-    reasons = (
-        [f"Danger words: {', '.join(unique_words[:10])}"]
-        + request_reasons
-        + pair_reasons
-    )
+    reasons: list[str] = []
+    if unique_words:
+        reasons.append(f"Danger words: {', '.join(unique_words[:10])}")
+    reasons.extend(request_reasons)
+    reasons.extend(pair_reasons)
 
     trust = max(0.0, min(100.0, 100.0 - risk))
     return ScoreResult(

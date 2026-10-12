@@ -9,6 +9,13 @@
   "request_window": 20,
   "request_bonus": 0.9,
   "pin_request_verbs": ["authorise", "authorize", "enter"],
+  "read_aloud_window": 6,
+  "read_aloud_bonus": 1.15,
+  "read_aloud_objects": ["code", "otp", "pin", "numeric", "number"],
+  "read_aloud_number_guards": ["account", "reference", "mobile", "phone", "contact", "card", "case"],
+  "read_aloud_context": ["account", "verification", "verify", "kyc", "refund", "upi"],
+  "disclose_verbs": ["read", "tell", "say", "share", "give", "repeat", "dictate", "speak", "provide", "what", "what's"],
+  "disclose_bonus": 1.7,
   "secrecy_phrases": ["between us"],
   "weights": {
     "otp": 0.9,
