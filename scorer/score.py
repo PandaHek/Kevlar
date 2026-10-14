@@ -81,6 +81,39 @@ def _negated(tokens: list[str], index: int) -> bool:
     return any(tok in {"not", "never", "don't", "dont"} for tok in prev)
 
 
+def _ask_negated(tokens: list[str], index: int) -> bool:
+    """True when a refusal governs this ask.
+
+    Looks back far enough for 'I will not ask you to share any code',
+    including won't, never, and nobody. Stops at a new instruction, so
+    'I will not ask for a code. Please share the OTP' is still an ask.
+    'If you do not share the code' is still a demand.
+    """
+    stops = {
+        "disconnect", "hang", "helpline", "hotline", "lawyer", "family",
+        "anyone", "video", "camera", "branch", "bank", "relative", "relatives",
+        "wife", "husband", "son", "daughter", "parents", "brother", "sister",
+        "friend", "friends", "worry", "worried", "alone", "confidential",
+        "privately", "call", "inform", "leave", "step",
+        "please", "but", "however", "instead", "then", "now",
+    }
+    negations = {
+        "not", "never", "don't", "dont", "won't", "wont",
+        "can't", "cant", "cannot", "without", "refrain",
+        "nobody", "noone",
+    }
+    for j in range(index - 1, max(-1, index - 13), -1):
+        tok = tokens[j]
+        if tok in stops:
+            return False
+        if tok in negations:
+            earlier = tokens[max(0, j - 4) : j]
+            if "if" in earlier:
+                return False
+            return True
+    return False
+
+
 def _secrecy_phrase_matches(tokens: list[str], phrases: Iterable[str]) -> list[Match]:
     found: list[Match] = []
     for phrase in phrases:
@@ -167,7 +200,8 @@ def _read_aloud_bonus(
 
     Matches 'read me the code', 'read the number aloud', and 'read out the numeric'.
     Skips 'account number' and 'reference number'. Skips 'do not read the code'.
-    A family OTP ask with no bank word (account, verification, refund, UPI) stays out.
+    Reading a number counts in a banking context. Claiming to be family
+    does not soften an ask: the call is from an unknown number.
     """
     object_set = {word.lower() for word in objects}
     guard_set = {word.lower() for word in number_guards}
@@ -198,39 +232,467 @@ def _disclose_number_bonus(
     *,
     window: int,
     bonus: float,
+    otp_bonus: float,
     verbs: Iterable[str],
     number_guards: Iterable[str],
 ) -> tuple[float, list[str]]:
-    """Bonus when any ask sits next to a one-time number, not only the word read.
+    """Bonus when any ask sits next to a one-time secret.
 
-    Covers 'tell me the six-digit number', 'what is the numeric value',
-    'say it aloud', 'share the number', and 'repeat the numeric value'.
-    'Account number' and 'reference number' do not count.
-    'Never say the six-digit number' does not count.
-    A number that merely appears ('a six-digit number will arrive') does not count.
+    The ask can be read, tell, dictate, convey, spell, share, and the rest
+    of the verb list. The secret can be an OTP, code, PIN, password, or
+    the digits of a number that just arrived.
+    Account numbers and reference numbers do not count.
+    'I will not ask you to share any code' does not count.
+    A later instruction still does: 'I will not ask for a code. Please share the OTP.'
+    'If you do not share the code' is still a demand.
+    A secret that merely arrives, with nobody asking for it, does not count.
     """
     verb_set = {verb.lower() for verb in verbs}
+    # 'Type the OTP' and 'enter the code' are asks. They must not also
+    # match 'enter it only on the official page' next to the word number.
+    keyed = {"type", "enter"}
+    verb_set.update(keyed)
     guard_set = {word.lower() for word in number_guards}
-    secret_indexes = [
-        i
-        for i, tok in enumerate(tokens)
-        if tok == "numeric"
-        or (
-            tok == "number"
-            and (i == 0 or tokens[i - 1] not in guard_set)
-        )
-    ]
-    if not secret_indexes:
+    plain = {"numeric", "number", "digit", "digits"}
+    named = {"otp", "code", "pin", "password", "passcode"}
+    secrets: list[tuple[int, float, bool]] = []
+    for i, tok in enumerate(tokens):
+        if tok in plain:
+            if tok == "number" and i > 0 and tokens[i - 1] in guard_set:
+                continue
+            secrets.append((i, bonus, False))
+        elif tok in named:
+            secrets.append((i, otp_bonus, True))
+    if not secrets:
         return 0.0, []
+    best = 0.0
+    for i, tok in enumerate(tokens):
+        if tok not in verb_set or _ask_negated(tokens, i):
+            continue
+        for index, amount, is_named in secrets:
+            if tok in keyed:
+                # The secret has to be what they are told to type.
+                # 'A code will appear. Enter it only on the official page' is not an ask.
+                if not is_named or index <= i or index - i > window:
+                    continue
+                best = max(best, amount)
+                continue
+            if abs(i - index) <= window:
+                best = max(best, amount)
+    if best <= 0:
+        return 0.0, []
+    return best, [f"Asked for a one-time number or code (request, +{best:.2f})"]
+
+
+def _window_has(tokens: list[str], index: int, words: set[str], gap: int) -> bool:
+    lo = max(0, index - gap)
+    hi = min(len(tokens), index + gap + 1)
+    return any(tokens[j] in words and j != index for j in range(lo, hi))
+
+
+def _money_window_has(tokens: list[str], index: int, words: set[str], gap: int) -> bool:
+    """Like _window_has, but a rupee amount does not use up the gap.
+
+    'transfer the extra 63000 back to the recovery account' stays one ask
+    even though 63,000 is two tokens.
+    """
+    for direction in (-1, 1):
+        seen = 0
+        j = index
+        while seen < gap:
+            j += direction
+            if j < 0 or j >= len(tokens):
+                break
+            if tokens[j].isdigit():
+                continue
+            seen += 1
+            if tokens[j] in words:
+                return True
+    return False
+
+
+def _skip_money_move(tokens: list[str], index: int) -> bool:
+    """Drops lookalikes that are not the caller asking to be paid.
+
+    'Transfer you' is a call handoff. 'Will be credited' and 'credit card'
+    are not 'please credit this account'. 'Put the account number' is
+    writing a number down.
+    """
+    tok = tokens[index]
+    nxt = tokens[index + 1] if index + 1 < len(tokens) else ""
+    prev = tokens[index - 1] if index else ""
+    if tok == "transfer" and nxt == "you":
+        return True
+    if tok == "put" and nxt in {"you", "me"}:
+        return True
+    if tok == "credit" and (nxt == "card" or prev == "card"):
+        return True
+    if tok == "credit" and prev not in {"please", "kindly", "now", "you", "must", "just", "simply"}:
+        return True
+    if tok in {"return", "reverse"} and prev in {"will", "be", "being", "been"}:
+        return True
+    if tok == "put" and _window_has(tokens, index, {"number"}, 4):
+        if not _window_has(tokens, index, {"money", "funds", "rupees", "wallet", "upi"}, 6):
+            return True
+    # 'Pay through the official app or at the branch' names their own channel.
+    # 'Pay into this account' does not.
+    if tok == "pay" and _window_has(tokens, index, {"official", "branch"}, 4):
+        return True
+    return False
+
+
+def _kept_quiet(
+    tokens: list[str],
+    index: int,
+    tok: str,
+    topic_set: set[str],
+    negation_set: set[str],
+    gap: int,
+) -> bool:
+    """True when this token is the caller cutting the user off from help.
+
+    A named person (lawyer, son, branch, bank) counts only next to a
+    contact verb, so 'don't worry, your son is fine' stays ordinary.
+    """
+    if tok in topic_set and _window_has(tokens, index, negation_set, gap):
+        return True
+    person = {
+        "bank", "branch", "lawyer", "relative", "relatives",
+        "wife", "husband", "son", "daughter", "parents",
+        "brother", "sister", "friend", "friends",
+    }
+    contact = {
+        "call", "contact", "tell", "inform", "speak", "discuss",
+        "visit", "check", "verify", "talk", "informing",
+    }
+    if (
+        tok in person
+        and _window_has(tokens, index, negation_set, gap)
+        and _window_has(tokens, index, contact, gap)
+    ):
+        return True
+    if (
+        tok == "leave"
+        and _window_has(tokens, index, negation_set, gap)
+        and _window_has(tokens, index, {"room", "house", "home"}, gap)
+    ):
+        return True
+    if tok == "step" and index + 1 < len(tokens) and tokens[index + 1] == "out":
+        if _window_has(tokens, index, negation_set, gap):
+            return True
+    if tok in {"video", "camera"} and (
+        _window_has(tokens, index, negation_set, gap)
+        or _window_has(tokens, index, {"keep", "stay"}, 4)
+    ):
+        return True
+    return False
+
+
+def _money_negated(tokens: list[str], index: int) -> bool:
+    """True when the payment instruction itself is cancelled.
+
+    Looks back far enough for 'will not ask you to move any money'.
+    Stops early if another order sits in between, so 'do not disconnect,
+    then transfer the money' is still a payment ask.
+    """
+    stops = {
+        "disconnect", "hang", "helpline", "hotline", "lawyer", "family",
+        "anyone", "video", "camera", "branch", "bank", "relative", "relatives",
+        "wife", "husband", "son", "daughter", "parents", "brother", "sister",
+        "friend", "friends", "worry", "worried", "alone", "confidential",
+        "privately", "call", "tell", "inform", "leave", "step",
+    }
+    negations = {"not", "never", "don't", "dont", "without", "refrain"}
+    for j in range(index - 1, max(-1, index - 9), -1):
+        tok = tokens[j]
+        if tok in stops:
+            return False
+        if tok in negations:
+            # "If you do not pay" is still a demand. "We will not ask you to pay" is not.
+            earlier = tokens[max(0, j - 4) : j]
+            if "if" in earlier:
+                return False
+            return True
+    return False
+
+
+def _structure_bonus(
+    tokens: list[str],
+    *,
+    bonus: float,
+    payment_bonus: float,
+    verbs: Iterable[str],
+    pronouns: Iterable[str],
+    secrets: Iterable[str],
+    lookback: int,
+    verb_gap: int,
+    money_moves: Iterable[str],
+    money_targets: Iterable[str],
+    money_gap: int,
+    isolation_marks: Iterable[str],
+    isolation_topics: Iterable[str],
+    isolation_negations: Iterable[str],
+    isolation_gap: int,
+) -> tuple[float, list[str]]:
+    """One call-level pattern, shared by polite code asks and money demands.
+
+    Handoff: the caller names a code, then asks the user to read or share
+    'that' or 'it'. The word code and the ask can sit a sentence apart.
+    Coercion: the caller asks for money to move and also tells the user
+    to stay alone, not to tell anyone, not to hang up, or not to check
+    with a lawyer, the bank, or a relative. Those two facts can sit
+    anywhere in the call.
+    """
+    verb_set = {word.lower() for word in verbs}
+    pronoun_set = {word.lower() for word in pronouns}
+    secret_set = {word.lower() for word in secrets}
+    move_set = {word.lower() for word in money_moves}
+    target_set = {word.lower() for word in money_targets}
+    mark_set = {word.lower() for word in isolation_marks}
+    topic_set = {word.lower() for word in isolation_topics}
+    negation_set = {word.lower() for word in isolation_negations}
+
     for i, tok in enumerate(tokens):
         if tok not in verb_set or _negated(tokens, i):
             continue
-        if any(abs(i - secret) <= window for secret in secret_indexes):
+        lo = i
+        hi = min(len(tokens), i + verb_gap + 1)
+        for j in range(lo, hi):
+            if tokens[j] not in pronoun_set:
+                continue
+            start = max(0, j - lookback)
+            if any(tokens[k] in secret_set for k in range(start, j)):
+                return bonus, [
+                    f"Asked to hand over a code just mentioned (request, +{bonus:.2f})"
+                ]
+
+    money = False
+    isolated = any(tok in mark_set for tok in tokens)
+    for i, tok in enumerate(tokens):
+        if (
+            tok in move_set
+            and not _skip_money_move(tokens, i)
+            and not _money_negated(tokens, i)
+            and _money_window_has(tokens, i, target_set, money_gap)
+        ):
+            if tok == "send" and not _money_window_has(
+                tokens, i, target_set - {"account"}, money_gap
+            ):
+                continue
+            money = True
+        if (
+            tok in {"gpay", "phonepe", "paytm", "googlepay"}
+            and not _money_negated(tokens, i)
+            and _money_window_has(
+                tokens, i, {"money", "thousand", "lakh", "lakhs", "rupees", "rupee"}, money_gap
+            )
+        ):
+            money = True
+        if not isolated and _kept_quiet(tokens, i, tok, topic_set, negation_set, isolation_gap):
+            isolated = True
+        if money and isolated:
             return bonus, [
-                f"Asked for a one-time number (request, +{bonus:.2f})"
+                f"Asked for money while saying to keep it quiet (request, +{bonus:.2f})"
             ]
+    if money:
+        return payment_bonus, [
+            f"Asked to pay into an account (request, +{payment_bonus:.2f})"
+        ]
     return 0.0, []
 
+
+_PAY_WORDS = {
+    "pay", "payment", "payments", "paying", "paid", "repay", "repayment",
+    "settle", "settlement", "dues",
+}
+
+
+def _pay_language_near(tokens: list[str], index: int, gap: int) -> bool:
+    """True when a pay request sits near this word.
+
+    Covers pay, payment, settle, dues, and 'clear the balance'.
+    The word balance on its own does not count.
+    """
+    if _window_has(tokens, index, _PAY_WORDS, gap):
+        return True
+    lo = max(0, index - gap)
+    hi = min(len(tokens), index + gap + 1)
+    for j in range(lo, hi):
+        if tokens[j] == "clear" and _window_has(tokens, j, {"balance"}, 4):
+            return True
+    return False
+
+
+def _payment_app_in_call(tokens: list[str]) -> bool:
+    """True when the caller points at a UPI or payment app."""
+    if any(tok in {"upi", "phonepe", "gpay", "paytm", "googlepay"} for tok in tokens):
+        return True
+    return any(
+        tok == "payment" and _window_has(tokens, i, {"app"}, 2)
+        for i, tok in enumerate(tokens)
+    )
+
+
+def _checklist_bonus(tokens: list[str], bonus: float) -> tuple[float, list[str], list[str]]:
+    """Flags asks that are scams even with no OTP word.
+
+    A call to action is installing an app, opening a file they send, scanning a
+    QR or entering a PIN to receive money, or opening a link.
+    Police, arrest, customs, a prize, or a QR that is only mentioned are
+    returned separately and do not score unless the call also makes an ask.
+    A refund that simply arrives, and 'update the official app', do not count.
+    """
+    found: list[str] = []
+    context: list[str] = []
+    mandate_in_call = any(tok in {"mandate", "autopay"} for tok in tokens)
+    payment_app_in_call = _payment_app_in_call(tokens)
+    fillers = {
+        "the", "a", "an", "your", "this", "that", "it", "from", "small",
+        "i", "i'd", "i'll", "i'm", "i've", "we", "we'd", "we'll", "you",
+        "he", "she", "they", "and", "or", "but", "so", "if", "to",
+    }
+    # "the update failed to install" is not "please install QuickSupport"
+    not_a_request = {"failed", "unable", "completed", "finished"}
+
+    for i, tok in enumerate(tokens):
+        if tok == "apk":
+            found.append("an apk file")
+            break
+        if tok in {"install", "download"} and not _negated(tokens, i):
+            if _window_has(tokens, i, {"app", "apk", "file", "application"}, 6):
+                found.append("install an app")
+                break
+            nxt = i + 1
+            already_happened = _window_has(tokens, i, not_a_request, 3)
+            if (
+                not already_happened
+                and nxt < len(tokens)
+                and tokens[nxt] not in fillers
+            ):
+                found.append("install an app")
+                break
+        if tok == "file" and not _negated(tokens, i):
+            opened = _window_has(tokens, i, {"click", "open", "tap"}, 6)
+            incoming = _window_has(
+                tokens, i, {"send", "sending", "sent", "whatsapp", "sms", "telegram"}, 8
+            )
+            if opened and incoming:
+                found.append("open a file they send")
+                break
+
+    receive = {"receive", "receiving", "cashback", "prize", "refund", "money"}
+    for i, tok in enumerate(tokens):
+        if _negated(tokens, i):
+            continue
+        qr_here = tok == "qr" or (tok == "scan" and _window_has(tokens, i, {"qr"}, 4))
+        if qr_here:
+            if _window_has(tokens, i, receive | {"pin", "transfer"}, 10) or _pay_language_near(
+                tokens, i, 10
+            ):
+                found.append("scan a QR")
+                break
+            context.append("a QR")
+            continue
+        if tok in {"enter", "type", "put"} and _window_has(tokens, i, {"pin"}, 6):
+            if _window_has(tokens, i, receive, 10):
+                found.append("enter a PIN to receive money")
+                break
+
+    for i, tok in enumerate(tokens):
+        if tok in {"http", "https", "www", "bitly", "tinyurl"} or (
+            tok == "bit" and i + 1 < len(tokens) and tokens[i + 1] == "ly"
+        ):
+            found.append("a link to click")
+            break
+        if tok == "link" and not _negated(tokens, i) and _window_has(
+            tokens,
+            i,
+            {"click", "tap", "open", "sent", "send", "sending", "sms", "message", "text", "whatsapp", "telegram"},
+            6,
+        ):
+            found.append("a link to click")
+            break
+        if tok in {"portal", "website", "url", "form", "site", "page"} and not _negated(tokens, i) and _window_has(
+            tokens,
+            i,
+            {"send", "sending", "sent", "sms", "click", "tap", "message", "text", "whatsapp", "telegram"},
+            8,
+        ):
+            found.append("a link to click")
+            break
+
+    for i, tok in enumerate(tokens):
+        if tok in {"share", "sharing"} and not _negated(tokens, i) and _window_has(
+            tokens, i, {"screen"}, 3
+        ):
+            found.append("share your screen")
+            break
+        if not _negated(tokens, i) and (
+            tok == "voucher" or (tok == "gift" and _window_has(tokens, i, {"card", "cards"}, 2))
+        ):
+            found.append("buy a gift card")
+            break
+        if tok in {"aadhaar", "aadhar", "pan", "passbook"} and not _negated(tokens, i) and _window_has(
+            tokens, i, {"send", "sending", "sent", "share", "whatsapp", "forward", "show", "hold"}, 6
+        ):
+            found.append("send or show an identity document")
+            break
+        # Tapping accept or confirm on a payment-app popup is the payment.
+        # Callers call that popup a cancellation, a reversal, or a pending item,
+        # and they never have to say UPI PIN.
+        if tok in {"approve", "accept", "confirm", "authorise", "authorize"} and not _ask_negated(tokens, i):
+            popup = {
+                "pending", "notification", "cancellation", "collect",
+                "reversal", "mandate", "autopay", "request", "pops", "popup",
+            }
+            near_popup = _window_has(tokens, i, popup, 8)
+            near_app = _window_has(
+                tokens, i, {"upi", "phonepe", "gpay", "paytm", "googlepay", "payment"}, 8
+            )
+            names_the_mandate = tok in {"confirm", "authorise", "authorize"} and (
+                _window_has(tokens, i, {"mandate", "autopay"}, 4)
+                or (
+                    mandate_in_call
+                    and _window_has(tokens, i, {"request", "cancellation"}, 8)
+                )
+            )
+            approves_collect = tok in {"approve", "accept"} and (
+                _window_has(tokens, i, {"collect", "mandate", "autopay"}, 8)
+                or (
+                    _window_has(tokens, i, {"request"}, 4)
+                    and _window_has(tokens, i, {"phonepe", "gpay", "paytm", "googlepay", "upi"}, 8)
+                )
+            )
+            taps_the_popup = (tok in {"approve", "accept"} and near_app) or (
+                near_popup and payment_app_in_call
+            )
+            if names_the_mandate or approves_collect or taps_the_popup:
+                found.append("approve a collect or autopay")
+                break
+        if tok == "read" and not _negated(tokens, i) and _window_has(
+            tokens, i, {"message", "messages", "sms"}, 6
+        ) and _window_has(tokens, i, {"me", "out", "aloud"}, 6):
+            found.append("read a message aloud")
+            break
+
+    if any(
+        tok in {"police", "cbi", "customs", "arrest"} and not _negated(tokens, i)
+        for i, tok in enumerate(tokens)
+    ):
+        context.append("police, CBI, customs, or arrest")
+
+    if any(tok in {"prize", "cashback", "lottery"} for tok in tokens):
+        context.append("a prize or cashback")
+    for i, tok in enumerate(tokens):
+        if tok == "returns" and _window_has(tokens, i, {"high", "guaranteed"}, 3):
+            context.append("very high returns")
+            break
+
+    if not found:
+        return 0.0, [], context
+    return bonus, [
+        f"Scam checks: {', '.join(found)} (request, +{bonus:.2f})"
+    ], context
 
 def level_for_trust(trust: float) -> str:
     if trust >= 80:
@@ -332,6 +794,13 @@ def score_text(
     tokens = tokenize(text)
     categories = _category_lookup(cfg)
     matches = _find_matches(tokens, weights, categories)
+    # A refused 'share' or 'tell' is not a danger word. A later real ask still is.
+    disclose_verbs = {word.lower() for word in cfg.get("disclose_verbs", [])}
+    matches = [
+        m
+        for m in matches
+        if m.word not in disclose_verbs or not _ask_negated(tokens, m.index)
+    ]
     matches.extend(
         _secrecy_phrase_matches(tokens, cfg.get("secrecy_phrases", []))
     )
@@ -375,6 +844,7 @@ def score_text(
             tokens,
             window=int(cfg.get("read_aloud_window", 6)),
             bonus=float(cfg.get("disclose_bonus", 1.7)),
+            otp_bonus=float(cfg.get("otp_ask_bonus", 0.85)),
             verbs=cfg.get(
                 "disclose_verbs",
                 [
@@ -395,6 +865,90 @@ def score_text(
                 "read_aloud_number_guards",
                 ["account", "reference", "mobile", "phone", "contact", "card", "case"],
             ),
+        )
+    if request_bonus == 0:
+        request_bonus, request_reasons = _structure_bonus(
+            tokens,
+            bonus=float(cfg.get("structure_bonus", 1.25)),
+            payment_bonus=float(cfg.get("payment_ask_bonus", 0.55)),
+            verbs=cfg.get("disclose_verbs", []),
+            pronouns=cfg.get("handoff_pronouns", ["that", "it"]),
+            secrets=cfg.get("handoff_secrets", ["code", "otp", "pin", "numeric"]),
+            lookback=int(cfg.get("handoff_lookback", 20)),
+            verb_gap=int(cfg.get("handoff_verb_gap", 4)),
+            money_moves=cfg.get(
+                "money_moves",
+                [
+                    "transfer", "deposit", "pay", "move", "send",
+                    "neft", "imps", "rtgs", "return", "reverse",
+                    "credit", "put", "load",
+                ],
+            ),
+            money_targets=cfg.get(
+                "money_targets",
+                [
+                    "account", "money", "funds", "bond", "rupees", "rupee",
+                    "upi", "wallet", "gpay", "phonepe", "paytm", "googlepay",
+                    "thousand", "lakh", "lakhs",
+                ],
+            ),
+            money_gap=int(cfg.get("money_gap", 8)),
+            isolation_marks=cfg.get("isolation_marks", ["alone", "confidential", "privately"]),
+            isolation_topics=cfg.get(
+                "isolation_topics",
+                [
+                    "family",
+                    "parties",
+                    "disclose",
+                    "tell",
+                    "anyone",
+                    "informing",
+                    "contact",
+                    "helpline",
+                    "hotline",
+                    "hang",
+                    "disconnect",
+                    "video",
+                    "camera",
+                ],
+            ),
+            isolation_negations=cfg.get(
+                "isolation_negations",
+                ["not", "never", "don't", "dont", "without", "refrain"],
+            ),
+            isolation_gap=int(cfg.get("isolation_gap", 6)),
+        )
+    checklist_bonus = float(cfg.get("checklist_bonus", 1.65))
+    check_bonus, check_reasons, context = _checklist_bonus(tokens, checklist_bonus)
+    if context and (request_bonus > 0 or check_bonus > 0):
+        if request_bonus > 0 and check_bonus < checklist_bonus:
+            check_bonus = checklist_bonus
+        check_reasons = [
+            *check_reasons,
+            "Scam checks: "
+            + ", ".join(dict.fromkeys(context))
+            + f" with an ask (request, +{check_bonus:.2f})",
+        ]
+    if check_bonus > request_bonus:
+        request_bonus = check_bonus
+    request_reasons = [*request_reasons, *check_reasons]
+    # Unknown number only. "Dad, I'm your son, transfer the money" is a scam,
+    # including a cloned voice. "Hi dad, see you for dinner" has no ask.
+    family_claim = {
+        "dad", "daddy", "papa", "mom", "mummy", "mama", "mother", "father",
+        "beta", "son", "daughter", "uncle", "aunt", "brother", "sister", "papa",
+    }
+    if "withdraw" in tokens and 0 < request_bonus < checklist_bonus:
+        request_bonus = checklist_bonus
+        request_reasons.append(
+            "Asked to pay in order to withdraw "
+            f"(request, +{request_bonus:.2f})"
+        )
+    if any(tok in family_claim for tok in tokens) and 0 < request_bonus < checklist_bonus:
+        request_bonus = checklist_bonus
+        request_reasons.append(
+            "Caller claims to be family and makes an ask "
+            f"(request, +{request_bonus:.2f})"
         )
 
     risk = float(previous_risk)
